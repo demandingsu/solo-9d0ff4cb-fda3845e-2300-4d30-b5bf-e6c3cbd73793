@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from . import allocation as alloc
+from . import flow as flowmod
 from .config import DB_PATH, MAX_ITEMS_PER_SUBMISSION
 
 SCHEMA = """
@@ -69,6 +70,59 @@ CREATE TABLE IF NOT EXISTS current_result (
     published_at   TEXT NOT NULL,
     total_households INTEGER NOT NULL
 );
+
+-- 外部核定供数：每次整版提交一行，绑定读取时的生成任务及两份输入版本。
+-- 失败记录也保留（用于审计与解释），但只有 feasible 记录会被 current_verification 引用。
+CREATE TABLE IF NOT EXISTS verifications (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    generation_id  INTEGER NOT NULL REFERENCES generations(id),
+    old_version    INTEGER NOT NULL REFERENCES versions(id),
+    new_version    INTEGER NOT NULL REFERENCES versions(id),
+    status         TEXT NOT NULL CHECK (status IN ('feasible', 'infeasible')),
+    total_households INTEGER NOT NULL,
+    shortfall      INTEGER,
+    submitted_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_verifications_generation ON verifications(generation_id);
+
+-- 整版提交的片区核定户数（失败记录同样保留）
+CREATE TABLE IF NOT EXISTS verification_demands (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    verification_id INTEGER NOT NULL REFERENCES verifications(id),
+    seq             INTEGER NOT NULL,
+    district_id     TEXT NOT NULL,
+    households      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_demands_verification ON verification_demands(verification_id);
+
+-- 相容时保存的逐格整数流向
+CREATE TABLE IF NOT EXISTS verification_flows (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    verification_id INTEGER NOT NULL REFERENCES verifications(id),
+    seq             INTEGER NOT NULL,
+    old_id          TEXT NOT NULL,
+    district_id     TEXT NOT NULL,
+    households      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_flows_verification ON verification_flows(verification_id);
+
+-- 不可行诊断：受限旧格 / 可达片区（按 seq 保持确定顺序）
+CREATE TABLE IF NOT EXISTS verification_blocked (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    verification_id INTEGER NOT NULL REFERENCES verifications(id),
+    kind            TEXT NOT NULL CHECK (kind IN ('old', 'district')),
+    seq             INTEGER NOT NULL,
+    ref_id          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_blocked_verification ON verification_blocked(verification_id);
+
+-- 单行表：始终指向“当前有效核定”，且该核定必须属于当前已发布的生成任务
+CREATE TABLE IF NOT EXISTS current_verification (
+    only_row        INTEGER PRIMARY KEY CHECK (only_row = 1),
+    verification_id INTEGER NOT NULL REFERENCES verifications(id),
+    generation_id   INTEGER NOT NULL REFERENCES generations(id),
+    published_at    TEXT NOT NULL
+);
 """
 
 
@@ -78,6 +132,10 @@ class NoVersionError(Exception):
 
 class ValidationError(Exception):
     """输入业务校验失败（编号重复、内部重叠等）。"""
+
+
+class NoPublishedResultError(Exception):
+    """尚无已发布的生成结果，无法进行核定供数。"""
 
 
 def _now() -> str:
@@ -378,3 +436,245 @@ def get_current_result(conn: sqlite3.Connection) -> dict[str, Any] | None:
         "new_version": new_version,
         "districts": districts,
     }
+
+
+# ---------- 外部核定供数 ----------
+
+def _current_published_generation(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    cur = conn.execute("SELECT * FROM current_result WHERE only_row=1").fetchone()
+    if cur is None:
+        return None
+    return conn.execute(
+        "SELECT * FROM generations WHERE id=?", (cur["generation_id"],)
+    ).fetchone()
+
+
+def create_verification(
+    items: list[dict[str, Any]], conn: sqlite3.Connection
+) -> tuple[int, dict[str, Any]]:
+    """整版提交片区核定户数，判定与当前已发布任务的相容性。
+
+    绑定读取时刻的生成任务（及其 old/new 版本快照）。
+    - 编号集合或总量不符：抛 ValidationError，不写入任何核定记录；
+    - 总量相同但不可行：保存一条 infeasible 记录（含受限旧格/可达片区/缺额），
+      不触碰 current_verification，旧有效核定保持不变；
+    - 相容：保存 feasible 记录与逐格整数流向，并在同一事务切换 current_verification。
+
+    返回 ("http_status", payload)，由路由层决定如何抛出，保证本函数的事务先提交。
+    """
+    grow = _current_published_generation(conn)
+    if grow is None:
+        raise NoPublishedResultError("尚无已发布的生成结果，无法核定供数")
+
+    gen_id = grow["id"]
+    old_version = _load_version(conn, grow["old_version"])
+    new_version = _load_version(conn, grow["new_version"])
+
+    # 1. 编号集合必须与当前任务的片区编号完全一致
+    expected_ids = [c["id"] for c in new_version["items"]]
+    submitted_ids = [it["id"] for it in items]
+    missing = [i for i in expected_ids if i not in set(submitted_ids)]
+    unknown = [i for i in submitted_ids if i not in set(expected_ids)]
+    if missing or unknown:
+        details = []
+        if missing:
+            details.append("缺少片区编号：" + ", ".join(missing))
+        if unknown:
+            details.append("未知片区编号：" + ", ".join(unknown))
+        raise ValidationError(
+            "核定编号与当前已发布任务（生成任务 "
+            f"{gen_id}）的片区编号不符；" + "；".join(details)
+        )
+
+    demand_by_id = {it["id"]: it["households"] for it in items}
+    total_verified = sum(demand_by_id.values())
+    total_old = sum(c["households"] for c in old_version["items"])
+    if total_verified != total_old:
+        raise ValidationError(
+            f"核定总户数 {total_verified} 与当前任务旧网格总户数 {total_old} 不一致，"
+            "无法判定相容（两侧总量必须相同）"
+        )
+
+    # 2. 依据任务快照的几何关系构造相交边（只看是否面积相交，不沿用面积比例）
+    old_rects = [
+        alloc.OldCell(
+            id=c["id"],
+            rect=(c["x1"], c["y1"], c["x2"], c["y2"]),
+            households=c["households"],
+        )
+        for c in old_version["items"]
+    ]
+    district_rects = [
+        alloc.NewDistrict(
+            id=c["id"], rect=(c["x1"], c["y1"], c["x2"], c["y2"])
+        )
+        for c in new_version["items"]
+    ]
+    overlap_edges = [
+        (cell.id, d.id)
+        for cell in old_rects
+        for d in district_rects
+        if alloc.overlap_area(cell.rect, d.rect) > 0
+    ]
+
+    result = flowmod.solve_transport(
+        old_cells=[(c.id, c.households) for c in old_rects],
+        districts=[(d.id, demand_by_id[d.id]) for d in district_rects],
+        overlap_edges=overlap_edges,
+    )
+
+    # 3. 写入核定主记录（成功/失败都留痕）
+    cur = conn.execute(
+        "INSERT INTO verifications(generation_id, old_version, new_version, status,"
+        " total_households, shortfall, submitted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            gen_id,
+            old_version["version"],
+            new_version["version"],
+            "feasible" if result.feasible else "infeasible",
+            total_verified,
+            None if result.feasible else result.shortfall,
+            _now(),
+        ),
+    )
+    verification_id = cur.lastrowid
+
+    for seq, it in enumerate(items):
+        conn.execute(
+            "INSERT INTO verification_demands(verification_id, seq, district_id, households)"
+            " VALUES (?, ?, ?, ?)",
+            (verification_id, seq, it["id"], it["households"]),
+        )
+
+    if result.feasible:
+        for seq, f in enumerate(result.flows):
+            conn.execute(
+                "INSERT INTO verification_flows(verification_id, seq, old_id, district_id,"
+                " households) VALUES (?, ?, ?, ?, ?)",
+                (verification_id, seq, f.old_id, f.district_id, f.households),
+            )
+        # 有效核定原子切换；失败路径绝不执行此语句，旧核定保持有效
+        conn.execute(
+            "INSERT INTO current_verification(only_row, verification_id, generation_id,"
+            " published_at) VALUES (1, ?, ?, ?) "
+            "ON CONFLICT(only_row) DO UPDATE SET "
+            "verification_id=excluded.verification_id,"
+            " generation_id=excluded.generation_id,"
+            " published_at=excluded.published_at",
+            (verification_id, gen_id, _now()),
+        )
+    else:
+        for seq, oid in enumerate(result.restricted_old_ids):
+            conn.execute(
+                "INSERT INTO verification_blocked(verification_id, kind, seq, ref_id)"
+                " VALUES (?, 'old', ?, ?)",
+                (verification_id, seq, oid),
+            )
+        for seq, did in enumerate(result.reachable_district_ids):
+            conn.execute(
+                "INSERT INTO verification_blocked(verification_id, kind, seq, ref_id)"
+                " VALUES (?, 'district', ?, ?)",
+                (verification_id, seq, did),
+            )
+
+    payload = _load_verification(conn, verification_id)
+    if result.feasible:
+        return 201, payload
+    return 422, payload
+
+
+def _load_verification(
+    conn: sqlite3.Connection, verification_id: int
+) -> dict[str, Any] | None:
+    vrow = conn.execute(
+        "SELECT * FROM verifications WHERE id=?", (verification_id,)
+    ).fetchone()
+    if vrow is None:
+        return None
+
+    demands = conn.execute(
+        "SELECT district_id, households FROM verification_demands"
+        " WHERE verification_id=? ORDER BY seq",
+        (verification_id,),
+    ).fetchall()
+    flows = conn.execute(
+        "SELECT old_id, district_id, households FROM verification_flows"
+        " WHERE verification_id=? ORDER BY seq",
+        (verification_id,),
+    ).fetchall()
+    blocked = conn.execute(
+        "SELECT kind, ref_id FROM verification_blocked"
+        " WHERE verification_id=? ORDER BY kind, seq",
+        (verification_id,),
+    ).fetchall()
+
+    old_totals: dict[str, int] = {}
+    flow_district_totals: dict[str, int] = {}
+    for f in flows:
+        old_totals[f["old_id"]] = old_totals.get(f["old_id"], 0) + f["households"]
+        flow_district_totals[f["district_id"]] = (
+            flow_district_totals.get(f["district_id"], 0) + f["households"]
+        )
+    # 相容时按流向汇总的片区合计与外部核定必然相等；保留 demands 原值作为对外视图
+    district_totals: dict[str, int] = {d["district_id"]: d["households"] for d in demands}
+    if vrow["status"] == "feasible":
+        # 零户数旧格/零需求片区没有正流量边，按绑定版本补齐零值后再做双侧护栏
+        old_version = _load_version(conn, vrow["old_version"])
+        for c in old_version["items"]:
+            old_totals.setdefault(c["id"], 0)
+        for did in district_totals:
+            flow_district_totals.setdefault(did, 0)
+        # 守恒护栏：逐片区流向合计必须等于核定户数
+        assert flow_district_totals == district_totals
+
+    return {
+        "id": vrow["id"],
+        "generation_id": vrow["generation_id"],
+        "old_version": vrow["old_version"],
+        "new_version": vrow["new_version"],
+        "status": vrow["status"],
+        "total_households": vrow["total_households"],
+        "submitted_at": vrow["submitted_at"],
+        "demands": [dict(d) for d in demands],
+        "flows": [dict(f) for f in flows],
+        "blocked_old_ids": [b["ref_id"] for b in blocked if b["kind"] == "old"],
+        "reachable_district_ids": [
+            b["ref_id"] for b in blocked if b["kind"] == "district"
+        ],
+        "shortfall": vrow["shortfall"],
+        "old_totals": [
+            {"old_id": k, "households": old_totals[k]} for k in sorted(old_totals)
+        ],
+        "district_totals": [
+            {"district_id": k, "households": district_totals[k]}
+            for k in sorted(district_totals)
+        ],
+    }
+
+
+def get_verification(
+    verification_id: int, conn: sqlite3.Connection
+) -> dict[str, Any] | None:
+    return _load_verification(conn, verification_id)
+
+
+def list_verifications(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute("SELECT id FROM verifications ORDER BY id").fetchall()
+    return [_load_verification(conn, r["id"]) for r in rows]
+
+
+def get_current_verification(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    """返回与当前已发布任务对应的有效核定。
+
+    仅当 current_verification 指向的核定所属任务仍是当前发布任务时返回；
+    发布切换后旧核定不会被当成新任务的结果（返回 None）。
+    """
+    cur = conn.execute(
+        "SELECT * FROM current_verification WHERE only_row=1"
+    ).fetchone()
+    if cur is None:
+        return None
+    published = _current_published_generation(conn)
+    if published is None or cur["generation_id"] != published["id"]:
+        return None
+    return _load_verification(conn, cur["verification_id"])
